@@ -129,6 +129,7 @@ def get_answer(llm, retriever, user_input, history):
         "truy vấn mới chứa đầy đủ các TỪ ĐỒNG NGHĨA và THUẬT NGỮ thường dùng trong văn bản quy định.\n"
         "Quy tắc chuyển đổi bắt buộc:\n"
         "- Nếu user hỏi về 'không được làm', 'không được phép làm', 'cấm làm' -> Phải mở rộng thành 'hành vi bị cấm, quy định nghiêm cấm, không được phép'.\n"
+        "- Nếu user hỏi về 'Ktx', 'Ký túc xá' -> phải mở rộng thành 'trung tâm quản lý ký túc xá và khu đô thị Đại học Quốc Gia Thành phố Hồ Chí Minh' \n"
         "- Nếu user hỏi về 'đi muộn', 'vắng mặt' -> Mở rộng thành 'vi phạm giờ giấc, kỷ luật lao động'.\n"
         "- Nếu user hỏi về 'tiền nong', 'thưởng' -> Mở rộng thành 'chế độ đãi ngộ, lương thưởng'.\n\n"
         f"Lịch sử hội thoại:\n{history_text}\n"
