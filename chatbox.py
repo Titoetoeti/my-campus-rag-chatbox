@@ -1,11 +1,3 @@
-"""
-RAG Chatbox - Streamlit App (Optimized version)
-D:\simpleRAGchatbox\
-    chatbox.py
-    .env                ← chứa GROQ_API_KEY=gsk_...
-    paper\*.txt
-    index\              ← tự tạo khi chạy lần đầu
-"""
 
 import os
 import streamlit as st
@@ -186,6 +178,18 @@ def get_answer(llm, retriever, user_input, history):
 st.set_page_config(page_title="RAG Chatbox", page_icon="🤖", layout="centered")
 st.title("🤖 RAG Chatbox")
 st.caption("Hỏi đáp thông tin từ tài liệu nội bộ (giới thiệu, nội quy, tầm nhìn...)")
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    password_input = st.text_input("🔑 Nhập mật khẩu nội bộ để sử dụng Chatbox:", type="password")
+    if password_input == "123456":  # <--- Thay mật khẩu bí mật của bạn ở đây
+        st.session_state.authenticated = True
+        st.rerun()
+    elif password_input:
+        st.error("❌ Sai mật khẩu, vui lòng liên hệ Admin.")
+    st.stop()  # Dừng toàn bộ code phía dưới nếu chưa nhập đúng mật khẩu
 
 vectordb       = load_vectordb()
 llm, retriever = load_llm_retriever(vectordb)
