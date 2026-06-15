@@ -1,10 +1,30 @@
-python-dotenv
-streamlit
-langchain
-langchain-core
-langchain-community
-langchain-groq
-faiss-cpu
-sentence-transformers
-pypdf
-docx2txt
+# ============================================================
+# RAG Chatbox - Requirements
+# Cài đặt: pip install -r requirements.txt
+# ============================================================
+
+# --- Giao diện web ---
+streamlit>=1.45.0
+
+# --- Biến môi trường (.env) ---
+python-dotenv>=1.0.0
+
+# --- Đọc PDF ---
+pdfplumber>=0.11.0
+
+# --- LangChain core + community ---
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+
+# --- LLM: Groq (Llama 3.3 70B) ---
+langchain-groq>=0.3.0
+
+# --- Vector store ---
+faiss-cpu>=1.9.0
+
+# --- Embedding model (multilingual-e5-small) ---
+sentence-transformers>=3.0.0
+
+# --- Backend cho HuggingFace embeddings ---
+torch>=2.0.0
+transformers>=4.40.0
