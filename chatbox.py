@@ -351,7 +351,7 @@ def get_answer(llm, retriever, user_input, history):
         "Bạn là trợ lý AI của tổ chức, chuyên trả lời câu hỏi dựa trên tài liệu nội bộ.\n\n"
         "NGUYÊN TẮC:\n"
         "1. Chỉ dùng thông tin trong 'NGỮ CẢNH TÀI LIỆU' bên dưới.\n"
-        "2. Nếu không tìm thấy thông tin → nói rõ: 'Tôi không tìm thấy thông tin này trong tài liệu.'\n"
+        "2. Nếu không tìm thấy thông tin → nói rõ: 'Tôi không tìm thấy thông tin này trong tài liệu. Vui lòng liên hệ số 1900.055.559 để biết thêm thông tin'\n"
         "3. Trả lời ngắn gọn, rõ ràng, đúng trọng tâm câu hỏi.\n"
         "4. Nếu câu hỏi liên quan đến quy định/điều cấm → trích dẫn rõ số Điều và nội dung.\n\n"
         "NGỮ CẢNH TÀI LIỆU:\n{context}\n\n"
@@ -373,7 +373,7 @@ def get_answer(llm, retriever, user_input, history):
 # 7. Streamlit UI
 # ──────────────────────────────────────────────
 st.set_page_config(page_title="RAG Chatbox", page_icon="🤖", layout="centered")
-st.title("🤖 RAG Chatbox")
+st.title("🤖 RAG Chatbox Ký túc xá")
 st.caption("Hỏi đáp thông tin từ tài liệu nội bộ")
 
 if "authenticated" not in st.session_state:
