@@ -28,3 +28,15 @@ sentence-transformers>=3.0.0
 # --- Backend cho HuggingFace embeddings ---
 torch>=2.0.0
 transformers>=4.40.0
+# Giai đoạn 2 — Hybrid Retrieval: Lexical Search (BM25)
+rank_bm25>=0.2.2
+ 
+# Giai đoạn 3 — Reranking: Cross-Encoder BGE-reranker-v2-m3 (chạy local, CPU)
+sentence-transformers>=3.0.0
+ 
+# (Khuyến nghị, KHÔNG bắt buộc) Tăng tốc tải model reranker (~2.27GB) lần đầu
+# từ HuggingFace — giảm thời gian khởi tạo AI đáng kể trên mạng tốt. Nếu
+# không cài, code vẫn chạy bình thường, chỉ tải bằng phương thức mặc định
+# (chậm hơn).
+hf_transfer>=0.1.6
+ 
