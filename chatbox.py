@@ -1,14 +1,24 @@
 r"""
-RAG Chatbox - Streamlit App (PDF-native version)
+RAG Chatbox - Streamlit App (PDF-native, 5-stage pipeline)
 D:\simpleRAGchatbox\
     chatbox.py
-    .env                <- GROQ_API_KEY=gsk_...
-    paper\*.pdf         <- DOC TRUC TIEP PDF (khong can .txt nua)
-    index\              <- tu tao khi chay lan dau
+    rag_pipeline.py       <- nhạc trưởng, ghép 5 giai đoạn
+    query_transform.py    <- Giai đoạn 1: Query Transformation
+    hybrid_retriever.py   <- Giai đoạn 2: Hybrid Retrieval (Vector + BM25 + RRF)
+    reranker.py           <- Giai đoạn 3: Reranking (BGE Cross-Encoder local)
+    corrective_rag.py     <- Giai đoạn 4: Corrective RAG (chỉ chấm điểm, không web search)
+    generation.py         <- Giai đoạn 5: Generation + Guard (Llama Guard)
+    chat_logger.py        <- Ghi log hỏi-đáp ra CSV (xem lại bằng Excel) cho mục đích quản lý
+    .env                  <- GROQ_API_KEY=gsk_...
+    paper\*.pdf           <- DOC TRUC TIEP PDF
+    index\                <- tu tao khi chay lan dau
+    logs\chat_log.csv     <- tu tao khi co luot hoi dau tien
 """
 
 import os
 import re
+import shutil
+from datetime import date
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -17,8 +27,11 @@ from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+
+from rag_pipeline import answer_question
+from hybrid_retriever import HybridRetriever
+from reranker import CrossEncoderReranker
+from chat_logger import log_turn, LOG_FILE
 
 # ──────────────────────────────────────────────
 # 1. Load và kiểm tra API key
@@ -60,14 +73,13 @@ INDEX_DIR = os.path.join(BASE_DIR, "index")
 # ──────────────────────────────────────────────
 # 3. Đọc và chunk PDF theo cấu trúc văn bản pháp lý
 #
-# Chiến lược chunking:
+# Chiến lược chunking (giữ nguyên như bản gốc — đã hoạt động tốt):
 #   - Tách theo Điều (Điều 1., Điều 2., ...) — đơn vị tri thức nhỏ nhất
 #   - Mỗi chunk giữ nguyên tiêu đề Chương cha để tăng ngữ cảnh
 #   - Chunk phụ lục (bảng vi phạm) tách riêng theo số thứ tự hàng
 #   - Khi chunk quá dài (>1200 ký tự) → tách theo khoảng trắng đoạn
 # ──────────────────────────────────────────────
 
-# Pattern nhận diện cấu trúc văn bản pháp lý tiếng Việt
 RE_CHUONG   = re.compile(r'^(Chương\s+[IVXLCDM]+\b.*)', re.MULTILINE)
 RE_DIEU     = re.compile(r'^(\s*Điều\s+\d+[\.\:][^\n]*)', re.MULTILINE)
 RE_PHAN     = re.compile(r'^(Phụ\s+lục\s+[IVXLCDM\d]+\b.*)', re.MULTILINE | re.IGNORECASE)
@@ -113,7 +125,6 @@ def chunk_legal_text(full_text: str, source: str) -> list[Document]:
     docs = []
     current_chapter = ""
 
-    # Tách thô theo Chương và Phụ lục
     split_points = []
     for m in RE_CHUONG.finditer(full_text):
         split_points.append(('chapter', m.start(), m.group(1)))
@@ -121,7 +132,6 @@ def chunk_legal_text(full_text: str, source: str) -> list[Document]:
         split_points.append(('annex', m.start(), m.group(1)))
     split_points.sort(key=lambda x: x[1])
 
-    # Lấy phần giới thiệu trước Chương I
     if split_points:
         intro_text = full_text[:split_points[0][1]].strip()
     else:
@@ -134,7 +144,6 @@ def chunk_legal_text(full_text: str, source: str) -> list[Document]:
                 metadata={"source": source, "chapter": "Giới thiệu", "section": "intro", "chunk_type": "content"}
             ))
 
-    # Xử lý từng Chương / Phụ lục
     for idx, (kind, start, title) in enumerate(split_points):
         end = split_points[idx + 1][1] if idx + 1 < len(split_points) else len(full_text)
         block = full_text[start:end].strip()
@@ -144,7 +153,6 @@ def chunk_legal_text(full_text: str, source: str) -> list[Document]:
             _chunk_chapter(block, current_chapter, source, docs)
 
         elif kind == 'annex':
-            # Phụ lục bảng → chunk theo đoạn ngắn
             for chunk in _split_long(block):
                 docs.append(Document(
                     page_content=chunk,
@@ -156,11 +164,9 @@ def chunk_legal_text(full_text: str, source: str) -> list[Document]:
 
 def _chunk_chapter(chapter_text: str, chapter_name: str, source: str, docs: list):
     """Chia một Chương thành các chunk theo Điều."""
-    # Tìm vị trí các Điều trong Chương
     dieu_matches = list(RE_DIEU.finditer(chapter_text))
 
     if not dieu_matches:
-        # Chương không có Điều riêng biệt → 1 chunk
         for chunk in _split_long(chapter_text):
             docs.append(Document(
                 page_content=chunk,
@@ -168,7 +174,6 @@ def _chunk_chapter(chapter_text: str, chapter_name: str, source: str, docs: list
             ))
         return
 
-    # Text trước Điều đầu tiên (tiêu đề chương)
     preamble = chapter_text[:dieu_matches[0].start()].strip()
     if preamble:
         docs.append(Document(
@@ -176,14 +181,12 @@ def _chunk_chapter(chapter_text: str, chapter_name: str, source: str, docs: list
             metadata={"source": source, "chapter": chapter_name, "section": chapter_name + " - Mở đầu", "chunk_type": "content"}
         ))
 
-    # Từng Điều
     for i, m in enumerate(dieu_matches):
         dieu_title = m.group(1).strip()
         dieu_start = m.start()
         dieu_end   = dieu_matches[i + 1].start() if i + 1 < len(dieu_matches) else len(chapter_text)
         dieu_body  = chapter_text[dieu_start:dieu_end].strip()
 
-        # Tiêu đề Điều + tên Chương để tăng ngữ cảnh
         header = f"{chapter_name} > {dieu_title}"
         full   = f"{header}\n{dieu_body}"
 
@@ -214,48 +217,6 @@ def load_pdf_documents(paper_dir: str) -> list[Document]:
             st.warning(f"⚠️ Không đọc được {fname}: {e}")
 
     return all_docs
-
-
-# ──────────────────────────────────────────────
-# 4. Vector DB — hỗ trợ cả PDF lẫn TXT (ưu tiên PDF)
-# ──────────────────────────────────────────────
-@st.cache_resource(show_spinner="⏳ Đang tải embedding model (lần đầu ~2 phút)...")
-def load_vectordb():
-    embeddings = HuggingFaceEmbeddings(
-        model_name="intfloat/multilingual-e5-small",
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
-    )
-
-    if os.path.exists(INDEX_DIR):
-        return FAISS.load_local(INDEX_DIR, embeddings, allow_dangerous_deserialization=True)
-
-    if not os.path.exists(PAPER_DIR):
-        st.error(f"❌ Không tìm thấy thư mục paper: {PAPER_DIR}")
-        st.stop()
-
-    # ── Ưu tiên đọc PDF ──
-    all_chunks = load_pdf_documents(PAPER_DIR)
-
-    # ── Fallback: nếu không có PDF nào thì đọc TXT như cũ ──
-    if not all_chunks:
-        from langchain_community.document_loaders import DirectoryLoader, TextLoader
-        loader = DirectoryLoader(
-            PAPER_DIR,
-            glob="**/*.txt",
-            loader_cls=TextLoader,
-            loader_kwargs={"encoding": "utf-8"},
-            show_progress=False,
-        )
-        raw_docs = loader.load()
-        if not raw_docs:
-            st.error(f"❌ Không có file PDF hoặc TXT nào trong: {PAPER_DIR}")
-            st.stop()
-        all_chunks = _parse_txt_documents(raw_docs)
-
-    vectordb = FAISS.from_documents(all_chunks, embeddings)
-    vectordb.save_local(INDEX_DIR)
-    return vectordb
 
 
 # ── Giữ lại parser TXT cũ như fallback (không xóa) ──
@@ -297,84 +258,74 @@ def _parse_txt_documents(raw_docs: list) -> list[Document]:
 
 
 # ──────────────────────────────────────────────
-# 5. LLM + Retriever
+# 4. Vector DB — hỗ trợ cả PDF lẫn TXT (ưu tiên PDF)
+#    Trả về cả vectordb (FAISS) lẫn all_chunks (list[Document]) vì
+#    Giai đoạn 2 (Hybrid Retrieval) cần all_chunks để khởi tạo BM25
+#    (BM25 không "index sẵn" như FAISS — cần load toàn bộ corpus mỗi lần).
+# ──────────────────────────────────────────────
+@st.cache_resource(show_spinner="⏳ Đang tải embedding model (lần đầu ~2 phút)...")
+def load_vectordb_and_chunks():
+    embeddings = HuggingFaceEmbeddings(
+        model_name="intfloat/multilingual-e5-small",
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+
+    # ── Ưu tiên đọc PDF ──
+    all_chunks = load_pdf_documents(PAPER_DIR)
+
+    # ── Fallback: nếu không có PDF nào thì đọc TXT như cũ ──
+    if not all_chunks:
+        from langchain_community.document_loaders import DirectoryLoader, TextLoader
+        loader = DirectoryLoader(
+            PAPER_DIR,
+            glob="**/*.txt",
+            loader_cls=TextLoader,
+            loader_kwargs={"encoding": "utf-8"},
+            show_progress=False,
+        )
+        raw_docs = loader.load()
+        if not raw_docs:
+            st.error(f"❌ Không có file PDF hoặc TXT nào trong: {PAPER_DIR}")
+            st.stop()
+        all_chunks = _parse_txt_documents(raw_docs)
+
+    if os.path.exists(INDEX_DIR):
+        vectordb = FAISS.load_local(INDEX_DIR, embeddings, allow_dangerous_deserialization=True)
+    else:
+        if not os.path.exists(PAPER_DIR):
+            st.error(f"❌ Không tìm thấy thư mục paper: {PAPER_DIR}")
+            st.stop()
+        vectordb = FAISS.from_documents(all_chunks, embeddings)
+        vectordb.save_local(INDEX_DIR)
+
+    return vectordb, all_chunks
+
+
+# ──────────────────────────────────────────────
+# 5. Khởi tạo pipeline 5 giai đoạn
+#    LLM chính (trả lời) + HybridRetriever (Giai đoạn 2) + Reranker (Giai đoạn 3).
+#    Các model "phụ trợ" (router, multi-query, grading, guard) được khởi tạo
+#    riêng bên trong từng module tương ứng — không cần load ở đây.
 # ──────────────────────────────────────────────
 @st.cache_resource(show_spinner="⚙️ Khởi tạo AI...")
-def load_llm_retriever(_vectordb):
+def load_pipeline_components(_vectordb, _all_chunks):
     llm = ChatGroq(
         model="llama-3.3-70b-versatile",
         api_key=GROQ_API_KEY,
         temperature=0.2,
     )
-    retriever = _vectordb.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": 6}
-    )
-    return llm, retriever
-
-
-def dedupe_by_section(docs: list[Document]) -> list[Document]:
-    """Loại bỏ chunk trùng section, ưu tiên giữ chunk content."""
-    seen = {}
-    for doc in docs:
-        key   = doc.metadata.get("section", "")
-        ctype = doc.metadata.get("chunk_type", "content")
-        if key not in seen:
-            seen[key] = doc
-        elif ctype == "content":
-            seen[key] = doc
-    return list(seen.values())
+    hybrid_retriever = HybridRetriever(_vectordb, _all_chunks)
+    reranker = CrossEncoderReranker()
+    return llm, hybrid_retriever, reranker
 
 
 # ──────────────────────────────────────────────
-# 6. Hàm trả lời
-# ──────────────────────────────────────────────
-def get_answer(llm, retriever, user_input, history):
-    raw_docs = retriever.invoke(user_input)
-    docs     = dedupe_by_section(raw_docs)
-
-    context_parts = []
-    for i, d in enumerate(docs):
-        src     = os.path.basename(d.metadata.get("source", "unknown"))
-        chapter = d.metadata.get("chapter", "")
-        section = d.metadata.get("section", "")
-        label   = f"{src} | {chapter} | {section}" if chapter != section else f"{src} | {section}"
-        context_parts.append(f"[Đoạn {i+1} | {label}]\n{d.page_content}")
-    context = "\n\n".join(context_parts)
-
-    history_text = ""
-    for m in history:
-        role = "Người dùng" if m["role"] == "user" else "Trợ lý"
-        history_text += f"{role}: {m['content']}\n"
-
-    prompt = ChatPromptTemplate.from_template(
-        "Bạn là trợ lý AI của tổ chức, chuyên trả lời câu hỏi dựa trên tài liệu nội bộ.\n\n"
-        "NGUYÊN TẮC:\n"
-        "1. Chỉ dùng thông tin trong 'NGỮ CẢNH TÀI LIỆU' bên dưới.\n"
-        "2. Nếu không tìm thấy thông tin → nói rõ: 'Tôi không tìm thấy thông tin này trong tài liệu. Vui lòng liên hệ số 1900.055.559 để biết thêm thông tin'\n"
-        "3. Trả lời ngắn gọn, rõ ràng, đúng trọng tâm câu hỏi.\n"
-        "4. Nếu câu hỏi liên quan đến quy định/điều cấm → trích dẫn rõ số Điều và nội dung.\n\n"
-        "NGỮ CẢNH TÀI LIỆU:\n{context}\n\n"
-        "LỊCH SỬ HỘI THOẠI:\n{history}\n\n"
-        "CÂU HỎI: {question}\n\n"
-        "TRẢ LỜI:"
-    )
-
-    chain  = prompt | llm | StrOutputParser()
-    answer = chain.invoke({
-        "context":  context,
-        "history":  history_text,
-        "question": user_input,
-    })
-    return answer, docs
-
-
-# ──────────────────────────────────────────────
-# 7. Streamlit UI
+# 6. Streamlit UI
 # ──────────────────────────────────────────────
 st.set_page_config(page_title="RAG Chatbox", page_icon="🤖", layout="centered")
-st.title("🤖 RAG Chatbox Ký túc xá")
-st.caption("Hỏi đáp thông tin từ tài liệu nội bộ")
+st.title("🤖 RAG Chatbox")
+st.caption("Hỏi đáp thông tin từ tài liệu nội bộ — Pipeline 5 giai đoạn")
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -388,8 +339,8 @@ if not st.session_state.authenticated:
         st.error("❌ Sai mật khẩu.")
     st.stop()
 
-vectordb       = load_vectordb()
-llm, retriever = load_llm_retriever(vectordb)
+vectordb, all_chunks = load_vectordb_and_chunks()
+llm, hybrid_retriever, reranker = load_pipeline_components(vectordb, all_chunks)
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -400,17 +351,42 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
     if st.button("🔄 Tải lại tài liệu"):
-        import shutil
         if os.path.exists(INDEX_DIR):
             shutil.rmtree(INDEX_DIR)
         st.cache_resource.clear()
         st.rerun()
     st.markdown("---")
-    st.markdown("**LLM:** Llama 3.3 70B (Groq)")
+    st.markdown("**LLM chính:** Llama 3.3 70B (Groq)")
+    st.markdown("**LLM phụ trợ:** Llama 3.1 8B Instant (Groq)")
     st.markdown("**Embedding:** multilingual-e5-small")
-    st.markdown("**Chunking:** Chương → Điều (PDF-native)")
-    st.markdown("**Nguồn:** PDF *(fallback: TXT)*")
+    st.markdown("**Reranker:** BGE-reranker-v2-m3 (local)")
+    st.markdown("**Guard:** Llama Guard 3 8B (Groq)")
+    st.markdown("---")
+    st.markdown(
+        "**Pipeline:**\n"
+        "1️⃣ Query Transformation\n"
+        "2️⃣ Hybrid Retrieval (Vector+BM25+RRF)\n"
+        "3️⃣ Reranking\n"
+        "4️⃣ Corrective RAG\n"
+        "5️⃣ Generation + Guard"
+    )
     st.success("✅ Sẵn sàng")
+
+    st.markdown("---")
+    st.subheader("📊 Quản lý")
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "rb") as f:
+            log_bytes = f.read()
+        num_rows = max(log_bytes.count(b"\n") - 1, 0)  # trừ dòng header
+        st.caption(f"Đã ghi nhận {num_rows} lượt hỏi.")
+        st.download_button(
+            "⬇️ Tải log hỏi-đáp (CSV)",
+            data=log_bytes,
+            file_name=f"chat_log_{date.today()}.csv",
+            mime="text/csv",
+        )
+    else:
+        st.caption("Chưa có log nào được ghi.")
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
@@ -425,21 +401,39 @@ if user_input := st.chat_input("Nhập câu hỏi của bạn..."):
 
     with st.chat_message("assistant"):
         with st.spinner("Đang suy nghĩ..."):
-            answer, sources = get_answer(llm, retriever, user_input, history)
+            result = answer_question(llm, hybrid_retriever, reranker, user_input, history)
 
-        st.markdown(answer)
+        # Ghi log quản lý ngay khi có kết quả — không phụ thuộc phần render UI
+        # bên dưới, nên dù UI lỗi (hiếm) thì log vẫn được lưu đầy đủ.
+        log_turn(user_input, result.standalone_query, result)
 
-        if sources:
+        st.markdown(result.answer)
+
+        if result.low_confidence:
+            st.info(f"⚠️ Tài liệu nội bộ có thể chưa đủ thông tin: {result.low_confidence_reason}")
+
+        if result.guard_flagged:
+            st.warning("⚠️ Câu trả lời đã được kiểm duyệt bởi Llama Guard.")
+
+        if result.sub_queries:
+            with st.expander("🔍 Câu hỏi mở rộng (Multi-Query)"):
+                for q in result.sub_queries:
+                    st.markdown(f"- {q}")
+
+        if result.sources:
             with st.expander("📄 Nguồn tham khảo"):
                 seen = set()
-                for doc in sources:
-                    src     = os.path.basename(doc.metadata.get("source", "unknown"))
+                for doc in result.sources:
+                    src     = doc.metadata.get("source", "unknown")
+                    src_label = os.path.basename(src)
                     section = doc.metadata.get("section", "")
                     chapter = doc.metadata.get("chapter", "")
+                    score   = doc.metadata.get("rerank_score", None)
                     key     = f"{src}::{section}"
                     if key not in seen:
                         label = f"{chapter} > {section}" if chapter and chapter != section else section
-                        st.markdown(f"- `{src}` — {label}")
+                        score_label = f" _(điểm rerank: {score})_" if score is not None else ""
+                        st.markdown(f"- `{src_label}` — {label}{score_label}")
                         seen.add(key)
 
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+    st.session_state.messages.append({"role": "assistant", "content": result.answer})
